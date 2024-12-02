@@ -1,0 +1,206 @@
+---
+- name: Deploy VM from OVF Template
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    # Specify variable file 
+    # ex. - /home/ansible/variablefile.yml
+  vars_prompt:
+    - name: "vcenter_password"
+      prompt: "Enter vCenter password"
+      private: yes  
+
+  tasks:
+# Deploy vm from ovf template in Content library # Add Library
+
+    - name: Deploy Virtual Machine from OVF template in content library with Thin storage
+      community.vmware.vmware_content_deploy_ovf_template:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        ovf_template: '{{ ovf_template_name }}'
+        library: "{{ ovf_library }}"
+        datastore: '{{ datastore_name }}'
+        folder: '{{ folder_name }}'
+        datacenter: '{{ datacenter_name }}'
+        cluster: '{{ cluster_name }}'
+        name: '{{ vm_name }}'
+        validate_certs: '{{ vcenter_validate_certs }}'
+        storage_provisioning: '{{ storage_provisioning }}'
+      delegate_to: localhost
+      register: deploy_result
+
+    - name: Customize Set portgroup
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: '{{ datacenter_name }}'
+        cluster: '{{ cluster_name }}'
+        name: '{{ vm_name }}'
+        state: present
+
+        networks:
+        - name: "{{ network_name }}"
+          device_type: vmxnet3
+
+    - name: Look up the VM to add cores
+      register: search_result
+      vmware.vmware_rest.vcenter_vm_info:
+         vcenter_hostname: '{{ vcenter_hostname }}'
+         vcenter_username: '{{ vcenter_username }}'
+         vcenter_password: '{{ vcenter_password }}'
+         vcenter_validate_certs: '{{ vcenter_validate_certs }}'
+         filter_names:
+         - '{{ vm_name }}'
+
+    - name: Collect information about a specific VM
+      vmware.vmware_rest.vcenter_vm_info:
+         vcenter_hostname: '{{ vcenter_hostname }}'
+         vcenter_username: '{{ vcenter_username }}'
+         vcenter_password: '{{ vcenter_password }}'
+         vcenter_validate_certs: '{{ vcenter_validate_certs }}'
+         vm: '{{ search_result.value[0].vm }}'
+      register: gather_vm_info
+
+    - name: Dedicated cores
+      vmware.vmware_rest.vcenter_vm_hardware_cpu:
+         vcenter_hostname: '{{ vcenter_hostname }}'
+         vcenter_username: '{{ vcenter_username }}'
+         vcenter_password: '{{ vcenter_password }}'
+         vcenter_validate_certs: '{{ vcenter_validate_certs }}'
+         vm: "{{ gather_vm_info.id}}"
+         count: '{{ cpu_count }}' 
+
+    - name: Increase the memory on the vm
+      vmware.vmware_rest.vcenter_vm_hardware_memory:
+         vcenter_hostname: '{{ vcenter_hostname }}'
+         vcenter_username: '{{ vcenter_username }}'
+         vcenter_password: '{{ vcenter_password }}'
+         vcenter_validate_certs: '{{ vcenter_validate_certs }}'
+         vm: "{{ gather_vm_info.id}}"
+         size_MiB: '{{ memory_size }}'
+
+    - name: Add disks to virtual machine using name
+      vmware_guest_disk:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter: "{{ datacenter_name }}"
+        validate_certs: '{{ vcenter_validate_certs }}'
+        name: '{{ vm_name }}'
+        disk:
+          - size_gb: 100
+            scsi_type: 'paravirtual'
+            type: thin
+            state: present
+            datastore: "{{ datastore_name }}"
+            scsi_controller: 0
+            unit_number: 2
+      delegate_to: localhost
+      register: disk_facts
+
+
+# After Deploying vm, customize the guest os
+
+    - name: Lookup vm
+      register: search_result
+      vmware.vmware_rest.vcenter_vm_info:
+        vcenter_hostname: '{{ vcenter_hostname }}'
+        vcenter_username: '{{ vcenter_username }}'
+        vcenter_password: '{{ vcenter_password }}'
+        vcenter_validate_certs: "false"
+        filter_names:
+        - "{{ vm_name }}"
+
+    - name: Collect information about a  vm
+      vmware.vmware_rest.vcenter_vm_info:
+        vcenter_hostname: '{{ vcenter_hostname }}'
+        vcenter_username: '{{ vcenter_username }}'
+        vcenter_password: '{{ vcenter_password }}'
+        vcenter_validate_certs: "false"
+        vm: '{{ search_result.value[0].vm }}'
+      register: test_vm1_info
+ 
+    - name: Power on the VM to register VMware tools
+      vmware.vmware_rest.vcenter_vm_power:
+        vcenter_hostname: '{{ vcenter_hostname }}'
+        vcenter_username: '{{ vcenter_username }}'
+        vcenter_password: '{{ vcenter_password }}'
+        vcenter_validate_certs: "false"
+        state: start
+        vm: "{{ test_vm1_info.id }}"
+
+    - name: Wait until my VMware tools are recognized
+      vmware.vmware_rest.vcenter_vm_tools_info:
+        vcenter_hostname: '{{ vcenter_hostname }}'
+        vcenter_username: '{{ vcenter_username }}'
+        vcenter_password: '{{ vcenter_password }}'
+        vcenter_validate_certs: "false"
+        vm: "{{ test_vm1_info.id }}"
+      register: vm_tools_info
+      until:
+        - vm_tools_info is not failed 
+        - vm_tools_info.value.run_state == "RUNNING"
+      retries: 3
+      delay: 60
+
+    - name: Power Off VM
+      vmware.vmware_rest.vcenter_vm_power:
+        vcenter_hostname: '{{ vcenter_hostname }}'
+        vcenter_username: '{{ vcenter_username }}'
+        vcenter_password: '{{ vcenter_password }}'
+        vcenter_validate_certs: "false"
+        state: stop
+        vm: "{{ test_vm1_info.id }}"
+
+    - name: Customize the VM
+      vmware.vmware_rest.vcenter_vm_guest_customization:
+        vcenter_hostname: '{{ vcenter_hostname }}'
+        vcenter_username: '{{ vcenter_username }}'
+        vcenter_password: '{{ vcenter_password }}'
+        vcenter_validate_certs: "false"
+        vm: "{{ test_vm1_info.id }}"
+        global_DNS_settings:
+          dns_suffix_list:
+            - "{{ dns_suffix }}"
+          dns_servers:
+            - "{{ dns_server }}"
+        interfaces:
+          - adapter:
+              ipv4:
+                type: STATIC
+                ip_address: "{{ ipv4_address }}"
+                gateways:
+                  - "{{ ip_gateway }}"
+                prefix: "{{ ip_prefix }}"
+        configuration_spec:
+          windows_config:
+            sysprep:
+              domain:
+                workgroup: "{{ workgroup_name }}"
+                type: "WORKGROUP"
+
+              user_data:
+                computer_name:
+                  type: FIXED
+                  fixed_name: "{{ vm_name }}"
+                full_name: "Ansibledeployment"
+                product_key: "{{ vm_gvlk }}"
+                organization: "{{ org_name }}"
+
+              gui_unattended:
+                password: "{{ vm_localpassword }}"
+                auto_logon_count: 1
+                auto_logon: true
+                time_zone: 0 # sets timzone to CST
+
+    - name: Power on the VM to apply customizations
+      vmware.vmware_rest.vcenter_vm_power:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ vcenter_validate_certs }}"
+        state: start
+        vm: "{{ test_vm1_info.id }}"
